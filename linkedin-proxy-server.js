@@ -59,10 +59,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version header (YYYYMM)
 
+// IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
+// that terminates HTTPS and forwards requests to your app as plain HTTP.
+// Without this line, req.protocol reports "http" even though the real
+// request was "https" — which silently breaks the redirect_uri LinkedIn
+// checks against, causing "redirect_uri does not match the registered value"
+// even when you copied the URL correctly.
+app.set('trust proxy', 1);
+
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
 app.get('/', (req, res) => {
-    res.send('LinkedIn proxy is running. Visit /auth/login once to set up, then use /api/linkedin-posts.');
+    res.send('LinkedIn proxy is running. Visit /auth/debug to see your exact redirect URI, /auth/login to set up, then use /api/linkedin-posts.');
 });
 
 // ---- In-memory access token cache (swap for Redis/DB in production) ----
@@ -123,8 +131,34 @@ function li(path, token) {
  */
 const REDIRECT_PATH = '/auth/callback';
 
+function computeRedirectUri(req) {
+    return `${req.protocol}://${req.get('host')}${REDIRECT_PATH}`;
+}
+
+/**
+ * GET /auth/debug
+ * Shows the EXACT redirect_uri this server will send to LinkedIn.
+ * Copy this value character-for-character into LinkedIn Developer Portal
+ * → your app → Auth tab → "Authorized redirect URLs for your app".
+ * This avoids any typo/http-vs-https mismatch when setting it up by hand.
+ */
+app.get('/auth/debug', (req, res) => {
+    const redirectUri = computeRedirectUri(req);
+    res.send(`
+        <html><body style="font-family: sans-serif; max-width: 640px; margin: 60px auto; line-height:1.6;">
+            <h2>Copy this exact value into LinkedIn</h2>
+            <p>Go to LinkedIn Developer Portal → your app → <strong>Auth</strong> tab →
+               <strong>Authorized redirect URLs for your app</strong>, and paste this value exactly
+               (select all, copy, don't retype it):</p>
+            <textarea readonly style="width:100%; height:50px; font-family:monospace; font-size:14px; padding:10px;">${redirectUri}</textarea>
+            <p style="color:#b45309;">If this shows <code>http://</code> instead of <code>https://</code>, the server isn't
+            detecting HTTPS correctly — double check the deployed code includes <code>app.set('trust proxy', 1)</code>.</p>
+        </body></html>
+    `);
+});
+
 app.get('/auth/login', (req, res) => {
-    const redirectUri = `${req.protocol}://${req.get('host')}${REDIRECT_PATH}`;
+    const redirectUri = computeRedirectUri(req);
     const scope = process.env.LINKEDIN_SCOPES || 'r_organization_social rw_organization_admin';
     const authUrl = 'https://www.linkedin.com/oauth/v2/authorization?' + new URLSearchParams({
         response_type: 'code',
@@ -145,7 +179,7 @@ app.get(REDIRECT_PATH, async (req, res) => {
         return res.status(400).send('<h2>Missing authorization code</h2>');
     }
 
-    const redirectUri = `${req.protocol}://${req.get('host')}${REDIRECT_PATH}`;
+    const redirectUri = computeRedirectUri(req);
 
     try {
         const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {

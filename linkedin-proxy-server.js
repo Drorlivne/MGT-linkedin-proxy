@@ -245,6 +245,7 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const normalized = [];
         for (const post of rawPosts) {
             const postUrn = post.id;
+            console.log(`Fetching stats for post URN: ${postUrn}`);
             let stats = { impressionCount: 0, clickCount: 0, likeCount: 0, commentCount: 0, shareCount: 0 };
 
             try {
@@ -254,8 +255,20 @@ app.get('/api/linkedin-posts', async (req, res) => {
                 );
                 if (statsRes.ok) {
                     const statsJson = await statsRes.json();
-                    const el = (statsJson.elements && statsJson.elements[0]) || {};
-                    const ts = el.totalShareStatistics || {};
+                    const el = (statsJson.elements && statsJson.elements[0]) || null;
+                    if (!el) {
+                        // LinkedIn's own docs: "Shares with no actions or impressions are not
+                        // included in the list of elements... can be assumed to have counts of 0."
+                        // This happens for two very different reasons that look identical from
+                        // here: (1) the post is genuinely brand new and LinkedIn hasn't finished
+                        // indexing its stats yet (can take some time after publishing), or
+                        // (2) the URN format this post ID is in doesn't match what this endpoint
+                        // expects (it wants a UGC post URN — the newer /rest/posts endpoint can
+                        // return URNs in a different format). Logging this makes it possible to
+                        // tell the two apart by checking postUrn's format below in the logs.
+                        console.warn(`No stats element returned for post ${postUrn} — likely not yet indexed by LinkedIn, or a URN-format mismatch. Raw response:`, JSON.stringify(statsJson));
+                    }
+                    const ts = (el && el.totalShareStatistics) || {};
                     stats = {
                         impressionCount: ts.impressionCount || 0,
                         clickCount: ts.clickCount || 0,
@@ -263,6 +276,8 @@ app.get('/api/linkedin-posts', async (req, res) => {
                         commentCount: ts.commentCount || 0,
                         shareCount: ts.shareCount || 0
                     };
+                } else {
+                    console.warn(`Stats request failed for ${postUrn}: HTTP ${statsRes.status} — ${await statsRes.text()}`);
                 }
             } catch (e) {
                 console.warn('Stats fetch failed for', postUrn, e.message);

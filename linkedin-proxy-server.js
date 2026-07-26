@@ -249,8 +249,18 @@ app.get('/api/linkedin-posts', async (req, res) => {
             let stats = { impressionCount: 0, clickCount: 0, likeCount: 0, commentCount: 0, shareCount: 0 };
 
             try {
+                // FIX: LinkedIn's current versioned REST API rejects the older "shares[0]"
+                // parameter name with QUERY_PARAM_NOT_ALLOWED (confirmed from live logs).
+                // The current correct parameter is "ugcPosts[0]", and per LinkedIn's docs
+                // it specifically expects a UGC Post URN (urn:li:ugcPost:...), not a Share
+                // URN (urn:li:share:...). If postUrn is in the share format, this call may
+                // still fail — that'll show up clearly in the logs below as a different,
+                // more specific error than QUERY_PARAM_NOT_ALLOWED.
+                if (postUrn && postUrn.startsWith('urn:li:share:')) {
+                    console.warn(`Post ${postUrn} is a Share URN, not a UGC Post URN — organizationalEntityShareStatistics may reject it. If stats fail below, this URN format is likely why.`);
+                }
                 const statsRes = await li(
-                    `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&shares[0]=${encodeURIComponent(postUrn)}`,
+                    `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts[0]=${encodeURIComponent(postUrn)}`,
                     token
                 );
                 if (statsRes.ok) {
@@ -259,14 +269,9 @@ app.get('/api/linkedin-posts', async (req, res) => {
                     if (!el) {
                         // LinkedIn's own docs: "Shares with no actions or impressions are not
                         // included in the list of elements... can be assumed to have counts of 0."
-                        // This happens for two very different reasons that look identical from
-                        // here: (1) the post is genuinely brand new and LinkedIn hasn't finished
-                        // indexing its stats yet (can take some time after publishing), or
-                        // (2) the URN format this post ID is in doesn't match what this endpoint
-                        // expects (it wants a UGC post URN — the newer /rest/posts endpoint can
-                        // return URNs in a different format). Logging this makes it possible to
-                        // tell the two apart by checking postUrn's format below in the logs.
-                        console.warn(`No stats element returned for post ${postUrn} — likely not yet indexed by LinkedIn, or a URN-format mismatch. Raw response:`, JSON.stringify(statsJson));
+                        // Most likely cause now that the parameter name is fixed: the post is
+                        // genuinely brand new and LinkedIn hasn't finished indexing its stats yet.
+                        console.warn(`No stats element returned for post ${postUrn} — likely not yet indexed by LinkedIn (recently published). Raw response:`, JSON.stringify(statsJson));
                     }
                     const ts = (el && el.totalShareStatistics) || {};
                     stats = {

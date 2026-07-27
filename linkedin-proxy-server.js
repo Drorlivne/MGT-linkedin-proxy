@@ -28,7 +28,7 @@
  *        LINKEDIN_REFRESH_TOKEN=xxxxx        (from your OAuth flow)
  *        LINKEDIN_ORG_URN=urn:li:organization:XXXXXXX
  *        ALLOWED_ORIGIN=https://your-dashboard-host.example.com
- *        LINKEDIN_POST_LIMIT=10               (optional, default 10 — see note below)
+ *        LINKEDIN_POST_LIMIT=25               (optional, default 25 — batching means this is cheap)
  *        LINKEDIN_STATS_DELAY_MS=300           (optional, default 300 — delay between stats calls)
  *   3. node linkedin-proxy-server.js
  *   4. Deploy it somewhere with HTTPS (Render/Railway/Fly.io/Lambda),
@@ -66,7 +66,7 @@ const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version heade
 // checking the startup logs will always show exactly which version is live —
 // this makes it possible to confirm a deploy actually took effect, instead of
 // guessing from log message patterns.
-const CODE_VERSION = 'v7-restli2-list-syntax-2026-07-27';
+const CODE_VERSION = 'v8-batched-restli2-confirmed-2026-07-27';
 
 // IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
 // that terminates HTTPS and forwards requests to your app as plain HTTP.
@@ -326,10 +326,10 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const token = await getAccessToken();
         const orgUrn = process.env.LINKEDIN_ORG_URN;
 
-        // How many recent posts to pull stats for on each sync. Kept deliberately
-        // small (see note below) — override via env var if you confirm your app's
-        // daily quota comfortably allows more.
-        const POST_LIMIT = parseInt(process.env.LINKEDIN_POST_LIMIT, 10) || 10;
+        // How many recent posts to pull stats for on each sync. Since stats are now
+        // fetched in a single batched call regardless of count, this can safely be
+        // higher than before — raised back to 25. Override via env var if needed.
+        const POST_LIMIT = parseInt(process.env.LINKEDIN_POST_LIMIT, 10) || 25;
 
         // 1) List recent posts authored by the organization.
         const postsRes = await li(
@@ -340,69 +340,52 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const postsData = await postsRes.json();
         const rawPosts = postsData.elements || [];
 
-        // 2) Fetch statistics ONE POST AT A TIME (for now — see note below).
+        // 2) Fetch statistics for ALL posts in ONE batched request.
         //
-        // ROOT CAUSE CONFIRMED (isolated /debug/stats-test, clean 400, no rate-limit
-        // headers present): this code was sending "X-Restli-Protocol-Version: 2.0.0"
-        // in the request headers, but encoding the array parameter using Rest.li
-        // PROTOCOL 1.0 syntax — indexed brackets like ugcPosts[0]=X. Protocol 2.0
-        // uses a different array syntax entirely: ugcPosts=List(X,Y,Z). That
-        // mismatch is what caused QUERY_PARAM_NOT_ALLOWED on every single request,
-        // regardless of whether it was one post or many — it was never a quota or
-        // permissions problem, it was a malformed parameter the whole time.
+        // ROOT CAUSE WAS CONFIRMED AND FIXED (isolated /debug/stats-test came back
+        // 200 OK with real data): the earlier QUERY_PARAM_NOT_ALLOWED errors were
+        // caused by mixing Rest.li protocol versions — sending the "2.0.0" header
+        // while encoding the array parameter with 1.0-style indexed brackets
+        // (ugcPosts[0]=X). The correct 2.0 syntax is ugcPosts=List(X,Y,Z), and a
+        // live test confirmed it returns real impression/like/comment/share data.
+        // This was never a quota or permissions problem.
         //
-        // This loop now uses the corrected List(...) syntax for a single post per
-        // call, which is a safe, minimal fix. Proper batching (many posts in one
-        // call via ugcPosts=List(A,B,C)) SHOULD now work too and would solve the
-        // quota problem far more elegantly — but batching hasn't been confirmed
-        // working yet. Test it first via:
-        //   /debug/stats-test?postUrn=A&postUrn=B&postUrn=C
-        // If that comes back 200 with data for multiple posts, this loop can be
-        // replaced with a single batched call again (ask for that update).
-        const STATS_DELAY_MS = parseInt(process.env.LINKEDIN_STATS_DELAY_MS, 10) || 300;
-        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        // Batching all posts into one call (instead of one call per post) is what
+        // actually solves the earlier 429 TOO_MANY_REQUESTS issue — it turns a
+        // 10-call sync into a single call.
+        const ugcPostUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:ugcPost:'));
+        const shareUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:share:'));
 
-        const statsMap = {}; // postUrn -> { impressionCount, clickCount, likeCount, commentCount, shareCount }
-        let quotaExhausted = false;
-
-        for (const post of rawPosts) {
-            const postUrn = post.id;
-            if (!postUrn || !postUrn.startsWith('urn:li:ugcPost:')) {
-                if (postUrn) console.warn(`Skipping stats for ${postUrn} — not a UGC Post URN (organizationalEntityShareStatistics requires urn:li:ugcPost:...).`);
-                continue;
-            }
-            if (quotaExhausted) {
-                // Once we hit a 429, every further call this sync will also fail —
-                // stop burning through remaining quota pointlessly.
-                continue;
-            }
-
-            try {
-                const statsRes = await li(
-                    `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts=List(${encodeURIComponent(postUrn)})`,
-                    token
-                );
-                if (statsRes.ok) {
-                    const statsJson = await statsRes.json();
-                    const el = (statsJson.elements && statsJson.elements[0]) || null;
-                    if (el) statsMap[postUrn] = el.totalShareStatistics || {};
-                    // No element = LinkedIn's docs say assume all-zero (usually a very
-                    // recently published post that hasn't been indexed yet) — fine,
-                    // statsMap just won't have an entry and defaults to 0 below.
-                } else if (statsRes.status === 429) {
-                    quotaExhausted = true;
-                    console.warn(`Daily quota reached at post ${postUrn} — stopping further stats requests for this sync. Already-fetched posts above are still good; try again after the quota resets (~24h).`);
-                } else {
-                    console.warn(`Stats request failed for ${postUrn}: HTTP ${statsRes.status} — ${await statsRes.text()}`);
-                }
-            } catch (e) {
-                console.warn('Stats fetch failed for', postUrn, e.message);
-            }
-
-            await sleep(STATS_DELAY_MS);
+        if (shareUrns.length) {
+            console.warn(`${shareUrns.length} post(s) have Share URNs instead of UGC Post URNs — organizationalEntityShareStatistics requires UGC Post URNs, so these are not fetched and will show as 0 for now:`, shareUrns);
         }
 
-        // 3) Normalize each post using the stats lookup gathered above.
+        const statsMap = {}; // postUrn -> { impressionCount, clickCount, likeCount, commentCount, shareCount }
+
+        if (ugcPostUrns.length) {
+            const listValue = 'List(' + ugcPostUrns.map(u => encodeURIComponent(u)).join(',') + ')';
+            console.log(`Fetching batched stats for ${ugcPostUrns.length} post(s) in a single request.`);
+            const statsRes = await li(
+                `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts=${listValue}`,
+                token
+            );
+            if (statsRes.ok) {
+                const statsJson = await statsRes.json();
+                const elements = statsJson.elements || [];
+                elements.forEach(el => {
+                    if (el.ugcPost) statsMap[el.ugcPost] = el.totalShareStatistics || {};
+                });
+                console.log(`Batched stats returned data for ${elements.length} of ${ugcPostUrns.length} requested post(s). Posts with no actions/impressions are expected to be omitted (LinkedIn treats them as all-zero).`);
+            } else {
+                const body = await statsRes.text();
+                console.warn(`Batched stats request failed: HTTP ${statsRes.status} — ${body}`);
+                if (statsRes.status === 429) {
+                    console.warn('Daily quota for this resource is exhausted — this will resolve automatically once LinkedIn resets the quota (typically within 24h). Avoid clicking "Sync Now" repeatedly in the meantime.');
+                }
+            }
+        }
+
+        // 3) Normalize each post using the batched stats lookup.
         const normalized = rawPosts.map(post => {
             const postUrn = post.id;
             const ts = statsMap[postUrn] || {};

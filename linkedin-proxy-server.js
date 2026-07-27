@@ -66,7 +66,7 @@ const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version heade
 // checking the startup logs will always show exactly which version is live —
 // this makes it possible to confirm a deploy actually took effect, instead of
 // guessing from log message patterns.
-const CODE_VERSION = 'v5-per-post-throttled-2026-07-27';
+const CODE_VERSION = 'v6-stats-diagnostic-2026-07-27';
 
 // IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
 // that terminates HTTPS and forwards requests to your app as plain HTTP.
@@ -79,7 +79,7 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
 app.get('/', (req, res) => {
-    res.send(`LinkedIn proxy is running. Version: ${CODE_VERSION}. Visit /auth/debug to see your exact redirect URI, /auth/login to set up, then use /api/linkedin-posts.`);
+    res.send(`LinkedIn proxy is running. Version: ${CODE_VERSION}. Visit /auth/debug to see your exact redirect URI, /auth/login to set up, /debug/stats-test?postUrn=... to isolate a single stats request, then use /api/linkedin-posts.`);
 });
 
 // ---- In-memory access token cache (swap for Redis/DB in production) ----
@@ -222,6 +222,79 @@ app.get(REDIRECT_PATH, async (req, res) => {
         `);
     } catch (err) {
         res.status(500).send(`<h2>Unexpected error</h2><pre>${err.message}</pre>`);
+    }
+});
+
+/**
+ * GET /debug/stats-test?postUrn=urn:li:ugcPost:XXXXXXXXXX
+ *
+ * Isolated diagnostic tool: makes exactly ONE request to
+ * organizationalEntityShareStatistics for exactly ONE post, and returns
+ * the full raw response — status code, all response headers (including
+ * any rate-limit / throttle headers LinkedIn sends back), and the raw
+ * body. This exists because the sync logs alone can't distinguish
+ * between "daily quota exhausted" and "this app isn't permitted to use
+ * this parameter/endpoint at all" — both can show up as errors that
+ * look similar in a noisy loop of 10 requests. One clean, isolated call
+ * makes the actual cause visible.
+ *
+ * Usage: open this URL in your browser (or ask whoever is helping you
+ * debug to open it), copy a real post URN from your Render logs (the
+ * "Fetching stats..." lines, or from /api/linkedin-posts output), and
+ * paste it into the postUrn query parameter.
+ */
+app.get('/debug/stats-test', async (req, res) => {
+    const postUrn = req.query.postUrn;
+    if (!postUrn) {
+        return res.status(400).send(`
+            <html><body style="font-family: sans-serif; max-width: 640px; margin: 60px auto; line-height:1.6;">
+                <h2>Missing postUrn</h2>
+                <p>Add <code>?postUrn=urn:li:ugcPost:XXXXXXXXXX</code> to this URL, using a real post URN from your Render logs.</p>
+                <p>Example: <code>${req.protocol}://${req.get('host')}/debug/stats-test?postUrn=urn:li:ugcPost:1234567890</code></p>
+            </body></html>
+        `);
+    }
+
+    try {
+        const token = await getAccessToken();
+        const orgUrn = process.env.LINKEDIN_ORG_URN;
+        const url = `https://api.linkedin.com/rest/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts[0]=${encodeURIComponent(postUrn)}`;
+
+        const statsRes = await fetch(url, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'LinkedIn-Version': LINKEDIN_VERSION,
+                'X-Restli-Protocol-Version': '2.0.0'
+            }
+        });
+
+        const bodyText = await statsRes.text();
+        const headersObj = {};
+        statsRes.headers.forEach((value, key) => { headersObj[key] = value; });
+
+        let bodyFormatted = bodyText;
+        try { bodyFormatted = JSON.stringify(JSON.parse(bodyText), null, 2); } catch (e) { /* leave as raw text */ }
+
+        res.set('Content-Type', 'text/plain');
+        res.send(
+`REQUEST URL:
+${url}
+
+REQUEST HEADERS:
+LinkedIn-Version: ${LINKEDIN_VERSION}
+X-Restli-Protocol-Version: 2.0.0
+
+RESPONSE STATUS: ${statsRes.status} ${statsRes.statusText}
+
+RESPONSE HEADERS:
+${JSON.stringify(headersObj, null, 2)}
+
+RESPONSE BODY:
+${bodyFormatted}
+`
+        );
+    } catch (err) {
+        res.status(500).send(`Unexpected error: ${err.message}`);
     }
 });
 

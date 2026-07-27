@@ -59,6 +59,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version header (YYYYMM)
 
+// Bump this string every time you deploy a meaningfully different version of
+// this file. Visiting the root URL (e.g. https://your-app.onrender.com/) or
+// checking the startup logs will always show exactly which version is live —
+// this makes it possible to confirm a deploy actually took effect, instead of
+// guessing from log message patterns.
+const CODE_VERSION = 'v4-batched-stats-2026-07-27';
+
 // IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
 // that terminates HTTPS and forwards requests to your app as plain HTTP.
 // Without this line, req.protocol reports "http" even though the real
@@ -70,7 +77,7 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
 app.get('/', (req, res) => {
-    res.send('LinkedIn proxy is running. Visit /auth/debug to see your exact redirect URI, /auth/login to set up, then use /api/linkedin-posts.');
+    res.send(`LinkedIn proxy is running. Version: ${CODE_VERSION}. Visit /auth/debug to see your exact redirect URI, /auth/login to set up, then use /api/linkedin-posts.`);
 });
 
 // ---- In-memory access token cache (swap for Redis/DB in production) ----
@@ -241,54 +248,70 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const postsData = await postsRes.json();
         const rawPosts = postsData.elements || [];
 
-        // 2) For each post, fetch its statistics and normalize.
-        const normalized = [];
-        for (const post of rawPosts) {
-            const postUrn = post.id;
-            console.log(`Fetching stats for post URN: ${postUrn}`);
-            let stats = { impressionCount: 0, clickCount: 0, likeCount: 0, commentCount: 0, shareCount: 0 };
+        // 2) Fetch statistics for ALL posts in ONE batched request instead of one
+        // request per post. This is the actual fix for 429 TOO_MANY_REQUESTS /
+        // "Resource level throttle ... DAY limit" errors: the previous version made
+        // up to 25 separate calls to organizationalEntityShareStatistics on every
+        // single sync, which burns through LinkedIn's daily quota for this specific
+        // resource almost immediately — especially if Sync Now gets clicked more
+        // than once. LinkedIn's own docs show this endpoint accepts MULTIPLE posts
+        // per call via repeated ugcPosts[N] params:
+        //   ...&ugcPosts[0]=urn:li:ugcPost:AAA&ugcPosts[1]=urn:li:ugcPost:BBB
+        // This drops a sync from ~25 calls down to just 1 (or 2, see below).
+        //
+        // Note: this endpoint specifically wants UGC Post URNs (urn:li:ugcPost:...).
+        // Posts whose ID comes back as a Share URN (urn:li:share:...) are batched
+        // separately below and may still fail — that's a distinct, separate issue
+        // from the rate limit, and will show up as its own clear error in the logs.
+        const ugcPostUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:ugcPost:'));
+        const shareUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:share:'));
 
-            try {
-                // FIX: LinkedIn's current versioned REST API rejects the older "shares[0]"
-                // parameter name with QUERY_PARAM_NOT_ALLOWED (confirmed from live logs).
-                // The current correct parameter is "ugcPosts[0]", and per LinkedIn's docs
-                // it specifically expects a UGC Post URN (urn:li:ugcPost:...), not a Share
-                // URN (urn:li:share:...). If postUrn is in the share format, this call may
-                // still fail — that'll show up clearly in the logs below as a different,
-                // more specific error than QUERY_PARAM_NOT_ALLOWED.
-                if (postUrn && postUrn.startsWith('urn:li:share:')) {
-                    console.warn(`Post ${postUrn} is a Share URN, not a UGC Post URN — organizationalEntityShareStatistics may reject it. If stats fail below, this URN format is likely why.`);
+        if (shareUrns.length) {
+            console.warn(`${shareUrns.length} post(s) have Share URNs instead of UGC Post URNs — stats for these are NOT fetched by this batched call and will show as 0 for now:`, shareUrns);
+        }
+
+        const statsMap = {}; // postUrn -> { impressionCount, clickCount, likeCount, commentCount, shareCount }
+
+        if (ugcPostUrns.length) {
+            const batchParams = ugcPostUrns.map((urn, i) => `ugcPosts[${i}]=${encodeURIComponent(urn)}`).join('&');
+            console.log(`Fetching batched stats for ${ugcPostUrns.length} post(s) in a single request.`);
+            const statsRes = await li(
+                `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&${batchParams}`,
+                token
+            );
+            if (statsRes.ok) {
+                const statsJson = await statsRes.json();
+                const elements = statsJson.elements || [];
+                elements.forEach(el => {
+                    // The response identifies each element by its ugcPost (or share) field.
+                    const urn = el.ugcPost || el.share;
+                    if (urn) statsMap[urn] = el.totalShareStatistics || {};
+                });
+                // Per LinkedIn's docs: posts with zero actions/impressions are simply
+                // omitted from "elements" rather than returned with zeros — that's
+                // expected and fine, statsMap just won't have an entry for them.
+                console.log(`Batched stats returned data for ${elements.length} of ${ugcPostUrns.length} requested post(s).`);
+            } else {
+                const body = await statsRes.text();
+                console.warn(`Batched stats request failed: HTTP ${statsRes.status} — ${body}`);
+                if (statsRes.status === 429) {
+                    console.warn('Daily quota for this resource is exhausted — this will resolve automatically once LinkedIn resets the quota (typically within 24h). Avoid clicking "Sync Now" repeatedly in the meantime.');
                 }
-                const statsRes = await li(
-                    `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts[0]=${encodeURIComponent(postUrn)}`,
-                    token
-                );
-                if (statsRes.ok) {
-                    const statsJson = await statsRes.json();
-                    const el = (statsJson.elements && statsJson.elements[0]) || null;
-                    if (!el) {
-                        // LinkedIn's own docs: "Shares with no actions or impressions are not
-                        // included in the list of elements... can be assumed to have counts of 0."
-                        // Most likely cause now that the parameter name is fixed: the post is
-                        // genuinely brand new and LinkedIn hasn't finished indexing its stats yet.
-                        console.warn(`No stats element returned for post ${postUrn} — likely not yet indexed by LinkedIn (recently published). Raw response:`, JSON.stringify(statsJson));
-                    }
-                    const ts = (el && el.totalShareStatistics) || {};
-                    stats = {
-                        impressionCount: ts.impressionCount || 0,
-                        clickCount: ts.clickCount || 0,
-                        likeCount: ts.likeCount || 0,
-                        commentCount: ts.commentCount || 0,
-                        shareCount: ts.shareCount || 0
-                    };
-                } else {
-                    console.warn(`Stats request failed for ${postUrn}: HTTP ${statsRes.status} — ${await statsRes.text()}`);
-                }
-            } catch (e) {
-                console.warn('Stats fetch failed for', postUrn, e.message);
             }
+        }
 
-            normalized.push({
+        // 3) Normalize each post using the batched stats lookup (no more per-post calls).
+        const normalized = rawPosts.map(post => {
+            const postUrn = post.id;
+            const ts = statsMap[postUrn] || {};
+            const stats = {
+                impressionCount: ts.impressionCount || 0,
+                clickCount: ts.clickCount || 0,
+                likeCount: ts.likeCount || 0,
+                commentCount: ts.commentCount || 0,
+                shareCount: ts.shareCount || 0
+            };
+            return {
                 externalId: postUrn,
                 date: (post.createdAt ? new Date(post.createdAt).toISOString().slice(0, 10) : ''),
                 topic: guessTopic(post),           // see note below
@@ -299,8 +322,8 @@ app.get('/api/linkedin-posts', async (req, res) => {
                 comments: stats.commentCount,
                 shares: stats.shareCount,
                 url: postUrn ? `https://www.linkedin.com/feed/update/${postUrn}` : ''
-            });
-        }
+            };
+        });
 
         res.json(normalized);
     } catch (err) {
@@ -346,4 +369,5 @@ function guessFormat(post) {
 
 app.listen(PORT, () => {
     console.log(`LinkedIn proxy listening on port ${PORT}`);
+    console.log(`>>> Running CODE_VERSION: ${CODE_VERSION} <<<`);
 });

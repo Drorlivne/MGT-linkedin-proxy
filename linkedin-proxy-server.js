@@ -66,7 +66,7 @@ const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version heade
 // checking the startup logs will always show exactly which version is live —
 // this makes it possible to confirm a deploy actually took effect, instead of
 // guessing from log message patterns.
-const CODE_VERSION = 'v9-share-urn-stats-2026-07-27';
+const CODE_VERSION = 'v10-preserve-on-quota-fail-2026-07-27';
 
 // IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
 // that terminates HTTPS and forwards requests to your app as plain HTTP.
@@ -357,6 +357,8 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const shareUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:share:'));
 
         const statsMap = {}; // postUrn -> { impressionCount, clickCount, likeCount, commentCount, shareCount }
+        let ugcBatchFailed = false;
+        let shareBatchFailed = false;
 
         if (ugcPostUrns.length) {
             const listValue = 'List(' + ugcPostUrns.map(u => encodeURIComponent(u)).join(',') + ')';
@@ -373,10 +375,11 @@ app.get('/api/linkedin-posts', async (req, res) => {
                 });
                 console.log(`Batched UGC Post stats returned data for ${elements.length} of ${ugcPostUrns.length} requested post(s). Posts with no actions/impressions are expected to be omitted (LinkedIn treats them as all-zero).`);
             } else {
+                ugcBatchFailed = true;
                 const body = await statsRes.text();
                 console.warn(`Batched UGC Post stats request failed: HTTP ${statsRes.status} — ${body}`);
                 if (statsRes.status === 429) {
-                    console.warn('Daily quota for this resource is exhausted — this will resolve automatically once LinkedIn resets the quota (typically within 24h). Avoid clicking "Sync Now" repeatedly in the meantime.');
+                    console.warn('Daily quota for this resource is exhausted — this will resolve automatically once LinkedIn resets the quota (typically within 24h). Avoid clicking "Sync Now" repeatedly in the meantime. Affected posts will report statsUnavailable so the dashboard keeps their previous numbers instead of zeroing them out.');
                 }
             }
         }
@@ -401,32 +404,43 @@ app.get('/api/linkedin-posts', async (req, res) => {
                 });
                 console.log(`Batched Share URN stats returned data for ${shareElements.length} of ${shareUrns.length} requested post(s).`);
             } else {
+                shareBatchFailed = true;
                 const body = await shareStatsRes.text();
-                console.warn(`Batched Share URN stats request failed: HTTP ${shareStatsRes.status} — ${body}. These posts will show as 0 for now.`);
+                console.warn(`Batched Share URN stats request failed: HTTP ${shareStatsRes.status} — ${body}. Affected posts will report statsUnavailable so the dashboard keeps their previous numbers instead of zeroing them out.`);
             }
         }
 
         // 3) Normalize each post using the batched stats lookup.
+        //
+        // IMPORTANT: if a post's batch request failed (e.g. 429 quota exhausted),
+        // we do NOT send 0 for its stats fields — sending 0 would tell the
+        // dashboard "this post genuinely has zero engagement," and the dashboard
+        // would overwrite whatever good data it already saved from a previous
+        // successful sync with zeros. Instead we send `null` and a `statsUnavailable`
+        // flag, and the dashboard is coded to keep its existing numbers when it
+        // sees that flag rather than blindly overwriting them.
         const normalized = rawPosts.map(post => {
             const postUrn = post.id;
-            const ts = statsMap[postUrn] || {};
-            const stats = {
-                impressionCount: ts.impressionCount || 0,
-                clickCount: ts.clickCount || 0,
-                likeCount: ts.likeCount || 0,
-                commentCount: ts.commentCount || 0,
-                shareCount: ts.shareCount || 0
-            };
+            const isUgc = postUrn && postUrn.startsWith('urn:li:ugcPost:');
+            const isShare = postUrn && postUrn.startsWith('urn:li:share:');
+            const batchFailedForThisPost = (isUgc && ugcBatchFailed) || (isShare && shareBatchFailed);
+
+            const ts = statsMap[postUrn] || null;
+            const statsUnavailable = batchFailedForThisPost && !ts;
+
+            const stats = ts || { impressionCount: 0, clickCount: 0, likeCount: 0, commentCount: 0, shareCount: 0 };
+
             return {
                 externalId: postUrn,
                 date: (post.createdAt ? new Date(post.createdAt).toISOString().slice(0, 10) : ''),
                 topic: guessTopic(post),           // see note below
                 format: guessFormat(post),         // see note below
-                impressions: stats.impressionCount,
-                clicks: stats.clickCount,
-                reactions: stats.likeCount,
-                comments: stats.commentCount,
-                shares: stats.shareCount,
+                impressions: statsUnavailable ? null : stats.impressionCount,
+                clicks: statsUnavailable ? null : stats.clickCount,
+                reactions: statsUnavailable ? null : stats.likeCount,
+                comments: statsUnavailable ? null : stats.commentCount,
+                shares: statsUnavailable ? null : stats.shareCount,
+                statsUnavailable: statsUnavailable,
                 url: postUrn ? `https://www.linkedin.com/feed/update/${postUrn}` : ''
             };
         });

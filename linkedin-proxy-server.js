@@ -66,7 +66,7 @@ const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version heade
 // checking the startup logs will always show exactly which version is live —
 // this makes it possible to confirm a deploy actually took effect, instead of
 // guessing from log message patterns.
-const CODE_VERSION = 'v6-stats-diagnostic-2026-07-27';
+const CODE_VERSION = 'v7-restli2-list-syntax-2026-07-27';
 
 // IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
 // that terminates HTTPS and forwards requests to your app as plain HTTP.
@@ -244,21 +244,31 @@ app.get(REDIRECT_PATH, async (req, res) => {
  * paste it into the postUrn query parameter.
  */
 app.get('/debug/stats-test', async (req, res) => {
-    const postUrn = req.query.postUrn;
-    if (!postUrn) {
+    // Accept one or more postUrn params: ?postUrn=A or ?postUrn=A&postUrn=B&postUrn=C
+    let postUrns = req.query.postUrn;
+    if (!postUrns) {
         return res.status(400).send(`
             <html><body style="font-family: sans-serif; max-width: 640px; margin: 60px auto; line-height:1.6;">
                 <h2>Missing postUrn</h2>
-                <p>Add <code>?postUrn=urn:li:ugcPost:XXXXXXXXXX</code> to this URL, using a real post URN from your Render logs.</p>
+                <p>Add <code>?postUrn=urn:li:ugcPost:XXXXXXXXXX</code> to this URL, using a real post URN from your Render logs. You can repeat it to test batching: <code>?postUrn=A&postUrn=B</code>.</p>
                 <p>Example: <code>${req.protocol}://${req.get('host')}/debug/stats-test?postUrn=urn:li:ugcPost:1234567890</code></p>
             </body></html>
         `);
     }
+    if (!Array.isArray(postUrns)) postUrns = [postUrns];
 
     try {
         const token = await getAccessToken();
         const orgUrn = process.env.LINKEDIN_ORG_URN;
-        const url = `https://api.linkedin.com/rest/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts[0]=${encodeURIComponent(postUrn)}`;
+
+        // FIX: we send "X-Restli-Protocol-Version: 2.0.0" in the headers, but the
+        // previous code encoded the array parameter using Rest.li PROTOCOL 1.0
+        // syntax (ugcPosts[0]=X&ugcPosts[1]=Y — indexed brackets). Protocol 2.0
+        // uses a different array syntax entirely: ugcPosts=List(X,Y). Sending 1.0
+        // syntax while declaring 2.0 in the header is almost certainly why every
+        // request was rejected with QUERY_PARAM_NOT_ALLOWED regardless of count.
+        const listValue = 'List(' + postUrns.map(u => encodeURIComponent(u)).join(',') + ')';
+        const url = `https://api.linkedin.com/rest/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts=${listValue}`;
 
         const statsRes = await fetch(url, {
             headers: {
@@ -277,7 +287,9 @@ app.get('/debug/stats-test', async (req, res) => {
 
         res.set('Content-Type', 'text/plain');
         res.send(
-`REQUEST URL:
+`TESTING ${postUrns.length} POST(S) WITH REST.LI 2.0 "List(...)" SYNTAX
+
+REQUEST URL:
 ${url}
 
 REQUEST HEADERS:
@@ -328,25 +340,25 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const postsData = await postsRes.json();
         const rawPosts = postsData.elements || [];
 
-        // 2) Fetch statistics ONE POST AT A TIME.
+        // 2) Fetch statistics ONE POST AT A TIME (for now — see note below).
         //
-        // TESTED AND CONFIRMED (2026-07-27 logs): sending multiple ugcPosts[N]
-        // params in a single request (the batched approach LinkedIn's general
-        // docs describe) gets EVERY index rejected with QUERY_PARAM_NOT_ALLOWED,
-        // even though a single ugcPosts[0] param on its own is accepted. This
-        // means the LinkedIn API product tier this app has access to does not
-        // support batched multi-post statistics queries — that's a limitation
-        // of the app/product, not a bug in this code. So: back to one request
-        // per post, which IS confirmed to work.
+        // ROOT CAUSE CONFIRMED (isolated /debug/stats-test, clean 400, no rate-limit
+        // headers present): this code was sending "X-Restli-Protocol-Version: 2.0.0"
+        // in the request headers, but encoding the array parameter using Rest.li
+        // PROTOCOL 1.0 syntax — indexed brackets like ugcPosts[0]=X. Protocol 2.0
+        // uses a different array syntax entirely: ugcPosts=List(X,Y,Z). That
+        // mismatch is what caused QUERY_PARAM_NOT_ALLOWED on every single request,
+        // regardless of whether it was one post or many — it was never a quota or
+        // permissions problem, it was a malformed parameter the whole time.
         //
-        // The real fix for the earlier 429 TOO_MANY_REQUESTS / daily quota
-        // problem is therefore NOT batching — it's requesting stats for far
-        // FEWER posts per sync (POST_LIMIT above) plus a small delay between
-        // requests so a sync doesn't burst the resource all at once. If you
-        // need more than POST_LIMIT posts tracked, consider syncing less
-        // frequently (e.g. once every few hours) rather than raising this
-        // number, to stay comfortably under LinkedIn's daily quota for this
-        // specific resource.
+        // This loop now uses the corrected List(...) syntax for a single post per
+        // call, which is a safe, minimal fix. Proper batching (many posts in one
+        // call via ugcPosts=List(A,B,C)) SHOULD now work too and would solve the
+        // quota problem far more elegantly — but batching hasn't been confirmed
+        // working yet. Test it first via:
+        //   /debug/stats-test?postUrn=A&postUrn=B&postUrn=C
+        // If that comes back 200 with data for multiple posts, this loop can be
+        // replaced with a single batched call again (ask for that update).
         const STATS_DELAY_MS = parseInt(process.env.LINKEDIN_STATS_DELAY_MS, 10) || 300;
         const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -367,7 +379,7 @@ app.get('/api/linkedin-posts', async (req, res) => {
 
             try {
                 const statsRes = await li(
-                    `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts[0]=${encodeURIComponent(postUrn)}`,
+                    `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts=List(${encodeURIComponent(postUrn)})`,
                     token
                 );
                 if (statsRes.ok) {

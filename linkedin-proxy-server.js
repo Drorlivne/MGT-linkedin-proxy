@@ -66,7 +66,7 @@ const LINKEDIN_VERSION = '202601'; // LinkedIn requires a LinkedIn-Version heade
 // checking the startup logs will always show exactly which version is live —
 // this makes it possible to confirm a deploy actually took effect, instead of
 // guessing from log message patterns.
-const CODE_VERSION = 'v8-batched-restli2-confirmed-2026-07-27';
+const CODE_VERSION = 'v9-share-urn-stats-2026-07-27';
 
 // IMPORTANT: Render (and most hosting platforms) sit behind a reverse proxy
 // that terminates HTTPS and forwards requests to your app as plain HTTP.
@@ -356,15 +356,11 @@ app.get('/api/linkedin-posts', async (req, res) => {
         const ugcPostUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:ugcPost:'));
         const shareUrns = rawPosts.map(p => p.id).filter(id => id && id.startsWith('urn:li:share:'));
 
-        if (shareUrns.length) {
-            console.warn(`${shareUrns.length} post(s) have Share URNs instead of UGC Post URNs — organizationalEntityShareStatistics requires UGC Post URNs, so these are not fetched and will show as 0 for now:`, shareUrns);
-        }
-
         const statsMap = {}; // postUrn -> { impressionCount, clickCount, likeCount, commentCount, shareCount }
 
         if (ugcPostUrns.length) {
             const listValue = 'List(' + ugcPostUrns.map(u => encodeURIComponent(u)).join(',') + ')';
-            console.log(`Fetching batched stats for ${ugcPostUrns.length} post(s) in a single request.`);
+            console.log(`Fetching batched stats for ${ugcPostUrns.length} UGC Post(s) in a single request.`);
             const statsRes = await li(
                 `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&ugcPosts=${listValue}`,
                 token
@@ -375,13 +371,38 @@ app.get('/api/linkedin-posts', async (req, res) => {
                 elements.forEach(el => {
                     if (el.ugcPost) statsMap[el.ugcPost] = el.totalShareStatistics || {};
                 });
-                console.log(`Batched stats returned data for ${elements.length} of ${ugcPostUrns.length} requested post(s). Posts with no actions/impressions are expected to be omitted (LinkedIn treats them as all-zero).`);
+                console.log(`Batched UGC Post stats returned data for ${elements.length} of ${ugcPostUrns.length} requested post(s). Posts with no actions/impressions are expected to be omitted (LinkedIn treats them as all-zero).`);
             } else {
                 const body = await statsRes.text();
-                console.warn(`Batched stats request failed: HTTP ${statsRes.status} — ${body}`);
+                console.warn(`Batched UGC Post stats request failed: HTTP ${statsRes.status} — ${body}`);
                 if (statsRes.status === 429) {
                     console.warn('Daily quota for this resource is exhausted — this will resolve automatically once LinkedIn resets the quota (typically within 24h). Avoid clicking "Sync Now" repeatedly in the meantime.');
                 }
+            }
+        }
+
+        if (shareUrns.length) {
+            // Same fix as ugcPosts above: the "shares" parameter takes the same
+            // Rest.li 2.0 List(...) syntax, not indexed brackets. The very first
+            // error ever seen in this project was QUERY_PARAM_NOT_ALLOWED on
+            // "shares[0]" — the same root cause as the ugcPosts issue, just never
+            // retested with the corrected syntax until now.
+            const shareListValue = 'List(' + shareUrns.map(u => encodeURIComponent(u)).join(',') + ')';
+            console.log(`Fetching batched stats for ${shareUrns.length} Share URN post(s) in a single request.`);
+            const shareStatsRes = await li(
+                `/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(orgUrn)}&shares=${shareListValue}`,
+                token
+            );
+            if (shareStatsRes.ok) {
+                const shareStatsJson = await shareStatsRes.json();
+                const shareElements = shareStatsJson.elements || [];
+                shareElements.forEach(el => {
+                    if (el.share) statsMap[el.share] = el.totalShareStatistics || {};
+                });
+                console.log(`Batched Share URN stats returned data for ${shareElements.length} of ${shareUrns.length} requested post(s).`);
+            } else {
+                const body = await shareStatsRes.text();
+                console.warn(`Batched Share URN stats request failed: HTTP ${shareStatsRes.status} — ${body}. These posts will show as 0 for now.`);
             }
         }
 
